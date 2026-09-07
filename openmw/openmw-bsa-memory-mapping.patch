@@ -1,0 +1,196 @@
+diff --git a/apps/openmw/engine.cpp b/apps/openmw/engine.cpp
+index 25aa03507c..d9c20651f2 100644
+--- a/apps/openmw/engine.cpp
++++ b/apps/openmw/engine.cpp
+@@ -18,6 +18,7 @@
+ #include <components/misc/strings/format.hpp>
+ 
+ #include <components/vfs/manager.hpp>
++#include <components/bsa/bsafile.hpp>
+ #include <components/vfs/registerarchives.hpp>
+ 
+ #include <components/sdlutil/imagetosurface.hpp>
+@@ -736,6 +737,10 @@ void OMW::Engine::prepareEngine()
+ 
+     mVFS = std::make_unique<VFS::Manager>();
+ 
++    // Optional: serve BSA entries from a read-only memory map instead of buffered reads (ported
++    // concept from Faster-File-Copy). Must be set before archives are opened below.
++    Bsa::BSAFile::setUseMemoryMapping(Settings::general().mBsaMemoryMapping);
++
+     // Optional: cache each loose-file data directory's recursive walk to speed up startup (ported
+     // concept from CRDW), especially over a virtual filesystem overlay like MO2. Opt-in setting.
+     std::filesystem::path vfsCacheDir;
+diff --git a/components/bsa/bsafile.cpp b/components/bsa/bsafile.cpp
+index 20dc09af37..07239789e3 100644
+--- a/components/bsa/bsafile.cpp
++++ b/components/bsa/bsafile.cpp
+@@ -31,14 +31,42 @@
+ #include <format>
+ #include <fstream>
+ #include <istream>
++#include <memory>
+ #include <system_error>
++#include <utility>
+ 
++#include <boost/iostreams/device/mapped_file.hpp>
++
++#include <components/debug/debuglog.hpp>
+ #include <components/esm/fourcc.hpp>
+ #include <components/files/constrainedfilestream.hpp>
++#include <components/files/memorystream.hpp>
+ #include <components/files/utils.hpp>
+ 
+ using namespace Bsa;
+ 
++bool BSAFile::sUseMemoryMapping = false;
++
++namespace
++{
++    // An istream over a slice of a memory-mapped archive that keeps the mapping alive for the
++    // stream's lifetime. No data is copied; reads are served from the demand-paged mapping.
++    class MappedArchiveStream : public Files::MemBuf, public std::istream
++    {
++    public:
++        MappedArchiveStream(
++            std::shared_ptr<boost::iostreams::mapped_file_source> mapping, const char* data, std::size_t size)
++            : Files::MemBuf(data, size)
++            , std::istream(static_cast<std::streambuf*>(this))
++            , mMapping(std::move(mapping))
++        {
++        }
++
++    private:
++        std::shared_ptr<boost::iostreams::mapped_file_source> mMapping;
++    };
++}
++
+ /// Error handling
+ [[noreturn]] void BSAFile::fail(const std::string& msg) const
+ {
+@@ -268,6 +296,28 @@ void BSAFile::open(const std::filesystem::path& file)
+         std::ifstream input(mFilepath, std::ios_base::binary);
+         readHeader(input);
+         mIsLoaded = true;
++
++        // Memory-map the whole archive read-only so getFile() can serve entries from the
++        // demand-paged mapping instead of buffered file IO. Mapping is lazy at the OS level
++        // (no eager read), and on any failure we simply fall back to the file-stream path.
++        if (sUseMemoryMapping)
++        {
++            try
++            {
++                auto mapping = std::make_shared<boost::iostreams::mapped_file_source>();
++                // boost::iostreams only accepts a narrow string/char* path here (its wide-string
++                // ctor is private). path::string() can throw for a path not representable in the
++                // native narrow encoding - that's caught below and we fall back to buffered reads.
++                mapping->open(mFilepath.string());
++                if (mapping->is_open())
++                    mMemoryMap = std::move(mapping);
++            }
++            catch (const std::exception& e)
++            {
++                Log(Debug::Warning) << "Failed to memory-map BSA archive " << Files::pathToUnicodeString(mFilepath)
++                                    << ": " << e.what() << " (falling back to buffered reads)";
++            }
++        }
+     }
+     else
+     {
+@@ -292,6 +342,15 @@ void Bsa::BSAFile::close()
+ 
+ Files::IStreamPtr Bsa::BSAFile::getFile(const FileStruct* file)
+ {
++    // Serve from the memory map when available (and the entry lies within it), otherwise fall
++    // back to a buffered constrained file stream. readHeader() already validated entry bounds.
++    if (mMemoryMap)
++    {
++        const std::size_t offset = file->mOffset;
++        const std::size_t size = file->mFileSize;
++        if (offset + size <= mMemoryMap->size())
++            return std::make_unique<MappedArchiveStream>(mMemoryMap, mMemoryMap->data() + offset, size);
++    }
+     return Files::openConstrainedFileStream(mFilepath, file->mOffset, file->mFileSize);
+ }
+ 
+diff --git a/components/bsa/bsafile.hpp b/components/bsa/bsafile.hpp
+index bc25e1f5da..16f3af3cec 100644
+--- a/components/bsa/bsafile.hpp
++++ b/components/bsa/bsafile.hpp
+@@ -27,12 +27,18 @@
+ #include <cstdint>
+ #include <filesystem>
+ #include <iosfwd>
++#include <memory>
+ #include <string>
+ #include <vector>
+ 
+ #include <components/files/conversion.hpp>
+ #include <components/files/istreamptr.hpp>
+ 
++namespace boost::iostreams
++{
++    class mapped_file_source;
++}
++
+ namespace Bsa
+ {
+ 
+@@ -92,6 +98,16 @@ namespace Bsa
+         /// Used for error messages
+         std::filesystem::path mFilepath;
+ 
++        /// Optional read-only memory map of the whole archive. When present, getFile() serves
++        /// entries directly from the demand-paged mapping instead of a buffered file stream,
++        /// cutting per-asset read latency (ported concept from Faster-File-Copy's uncompressed
++        /// path). Set up in open() when memory mapping is enabled; null means fall back to file IO.
++        std::shared_ptr<boost::iostreams::mapped_file_source> mMemoryMap;
++
++        /// Process-wide switch (set once at startup from the "bsa memory mapping" setting) that
++        /// controls whether open() memory-maps archives. Off for standalone tools by default.
++        static bool sUseMemoryMapping;
++
+         /// Error handling
+         [[noreturn]] void fail(const std::string& msg) const;
+ 
+@@ -115,6 +131,9 @@ namespace Bsa
+ 
+         void close();
+ 
++        /// Enable/disable memory mapping of archives for all subsequently opened BSAFiles.
++        static void setUseMemoryMapping(bool enabled) { sUseMemoryMapping = enabled; }
++
+         /* -----------------------------------
+          * Archive file routines
+          * -----------------------------------
+diff --git a/components/settings/categories/general.hpp b/components/settings/categories/general.hpp
+index c23c66e2d6..b1147f2a90 100644
+--- a/components/settings/categories/general.hpp
++++ b/components/settings/categories/general.hpp
+@@ -36,6 +36,10 @@ namespace Settings
+         // (ported concept from CRDW), especially over a virtual filesystem overlay like MO2. The
+         // cache auto-rebuilds when a data directory's modification time changes.
+         SettingValue<bool> mVfsDirectoryCache{ mIndex, "General", "vfs directory cache" };
++        // Memory-map BSA archives and serve their (uncompressed) entries from the demand-paged
++        // mapping instead of buffered file reads, cutting per-asset read latency (ported concept
++        // from Faster-File-Copy's uncompressed path).
++        SettingValue<bool> mBsaMemoryMapping{ mIndex, "General", "bsa memory mapping" };
+         // Cap the resolution of mipmapped textures at load time by skipping the top mip level(s)
+         // (no resampling), to save VRAM (ported concept from TextureDownscaler). Max width/height
+         // in pixels; 0 disables.
+diff --git a/files/settings-default.cfg b/files/settings-default.cfg
+index 2a5f96bd24..f2228a9f60 100644
+--- a/files/settings-default.cfg
++++ b/files/settings-default.cfg
+@@ -474,6 +474,11 @@ console history buffer size = 4096
+ # off/on to force a full rebuild.
+ vfs directory cache = false
+ 
++# Memory-map BSA archives and serve their entries directly from the demand-paged mapping instead of
++# buffered file reads, reducing per-asset read latency. Falls back to buffered reads if a mapping
++# fails. 64-bit only benefits meaningfully; leaves loose files (already OS-cached) untouched.
++bsa memory mapping = false
++
+ # Cap the resolution of mipmapped textures at load time by skipping the top mip level(s) (no
+ # resampling), to save VRAM. Value is the max width/height in pixels; 0 disables. Only affects
+ # textures that ship with mipmaps (e.g. most DDS); textures without mipmaps are left untouched.
